@@ -83,11 +83,11 @@ def register_in_duckdb(df: pl.DataFrame) -> duckdb.DuckDBPyConnection:
 # Upload step (only shown until data is loaded)
 # ======================================================
 if "data" not in st.session_state:
-    uploaded = st.file_uploader(
-        "Upload TMSS Rate File export(s) (.xlsx)",
-        type=["xlsx"],
-        accept_multiple_files=True
-    )
+   uploaded = st.file_uploader(
+    "Upload TMSS Rate File export(s) (.xlsx or .csv)",
+    type=["xlsx", "csv"],
+    accept_multiple_files=True
+)
 
     if not uploaded:
         st.info("Upload one or more TMSS exports to begin.")
