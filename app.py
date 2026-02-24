@@ -30,10 +30,6 @@ def reset_app():
 
 
 def load_with_progress(files) -> pl.DataFrame:
-    """
-    Load multiple Excel files with a UI progress bar.
-    Runs ONLY when user clicks 'Process Files'.
-    """
     progress = st.progress(0, text="Starting…")
     status = st.empty()
 
@@ -43,7 +39,12 @@ def load_with_progress(files) -> pl.DataFrame:
     for i, f in enumerate(files, start=1):
         status.write(f"Reading file {i}/{total}: **{f.name}**")
 
-        pdf = pd.read_excel(f, engine="openpyxl")
+        name = f.name.lower()
+        if name.endswith(".csv"):
+            pdf = pd.read_csv(f)
+        else:
+            pdf = pd.read_excel(f, engine="openpyxl")
+
         pdf.columns = [c.strip() for c in pdf.columns]
 
         missing = [c for c in REQUIRED_COLS if c not in pdf.columns]
@@ -53,11 +54,8 @@ def load_with_progress(files) -> pl.DataFrame:
         pdf = pdf[REQUIRED_COLS].copy()
         df = pl.from_pandas(pdf)
 
-        # Clean strings
         for c in STRING_COLS:
             df = df.with_columns(pl.col(c).cast(pl.Utf8).str.strip_chars().alias(c))
-
-        # Cast numerics
         for c in NUMERIC_COLS:
             df = df.with_columns(pl.col(c).cast(pl.Float64, strict=False).alias(c))
 
