@@ -203,7 +203,7 @@ rows = apply_factor_mode(rows)
 st.write("## Chunk Pivot View (Scroll lanes, SCACs across top)")
 
 metric_map = {
-    "Linehaul %": "LINEHAUL",
+    "HHE %": "LINEHAUL",
     "SIT %": "STORAGEINTRANSIT",
     "Accessorial %": "ACCESSORIALS",
     "UAB %": "UNACCOMPANIEDAIRBAG",
