@@ -201,7 +201,9 @@ rows = apply_factor_mode(rows)
 # Chunk Pivot View (scroll large chunks)
 # ======================================================
 st.write("## Chunk Pivot View (Scroll lanes, SCACs across top)")
+st.caption("Tip: use trackpad horizontal scroll or Shift + mousewheel to scroll across SCAC columns.")
 
+# --- UI label rename: Linehaul -> HHE ---
 metric_map = {
     "HHE %": "LINEHAUL",
     "SIT %": "STORAGEINTRANSIT",
@@ -218,6 +220,9 @@ metric_label = st.selectbox(
     key="chunk_metric"
 )
 metric_col = metric_map[metric_label]
+
+# --- set your own SCAC here ---
+OUR_SCAC = "AMJV"
 
 chunk_pd = rows.select(["SROID", "ORIGIN", "DESTINATION", "SCAC", metric_col]).to_pandas()
 
@@ -236,21 +241,87 @@ else:
     pivot["max_competitor"] = pivot.max(axis=1, numeric_only=True)
     pivot["avg_competitor"] = pivot.mean(axis=1, numeric_only=True)
 
+    # Round to whole numbers (uniform)
+    for c in ["avg_competitor", "min_competitor", "max_competitor"]:
+        pivot[c] = pivot[c].round(0)
+
     # Put derived columns first
     derived_cols = ["avg_competitor", "min_competitor", "max_competitor"]
     scac_cols = [c for c in pivot.columns if c not in derived_cols]
+
+    # If AMJV exists, move it to the first SCAC position by default (still draggable by user)
+    if OUR_SCAC in scac_cols:
+        scac_cols = [OUR_SCAC] + [c for c in scac_cols if c != OUR_SCAC]
+
     pivot = pivot[derived_cols + scac_cols]
 
-    st.dataframe(pivot, use_container_width=True, height=650)
+    # --- Styling: wrap headers, bold & highlight AMJV, and add a border box around avg/min/max ---
+    def highlight_our_scac(s: pd.Series):
+        # Applies to a column (Series). We'll style the whole AMJV column.
+        if s.name == OUR_SCAC:
+            return ["font-weight: 700; background-color: #fff3cd;"] * len(s)
+        return [""] * len(s)
 
-    csv_data = pivot.to_csv().encode("utf-8")
-    st.download_button(
-        f"Download Chunk Pivot (CSV) — {metric_label}",
-        data=csv_data,
-        file_name=f"tmss_chunk_pivot_{metric_col}.csv",
-        mime="text/csv"
+    # Build styler
+    styler = pivot.style
+
+    # Highlight AMJV column
+    styler = styler.apply(highlight_our_scac, axis=0)
+
+    # Visually separate derived columns with borders
+    styler = styler.set_properties(
+        subset=pd.IndexSlice[:, ["avg_competitor", "min_competitor", "max_competitor"]],
+        **{"border": "2px solid #999", "font-weight": "600"}
     )
 
+    # Wrap header text so you can shrink columns
+    styler = styler.set_table_styles([
+        {"selector": "th", "props": [("white-space", "normal"), ("word-wrap", "break-word"), ("max-width", "120px")]},
+        {"selector": "td", "props": [("white-space", "nowrap")]}
+    ])
+
+    # If you want AMJV header to stand out even more
+    if OUR_SCAC in pivot.columns:
+        # rename for display only (keeps real col name in data)
+        # safest: make a copy for display
+        pivot_display = pivot.copy()
+        pivot_display.rename(columns={OUR_SCAC: f"{OUR_SCAC} (OURS)"}, inplace=True)
+
+        # Rebuild styler for display table
+        def highlight_ours_display(s: pd.Series):
+            if s.name == f"{OUR_SCAC} (OURS)":
+                return ["font-weight: 700; background-color: #fff3cd;"] * len(s)
+            return [""] * len(s)
+
+        styler = pivot_display.style.apply(highlight_ours_display, axis=0)
+        styler = styler.set_properties(
+            subset=pd.IndexSlice[:, ["avg_competitor", "min_competitor", "max_competitor"]],
+            **{"border": "2px solid #999", "font-weight": "600"}
+        )
+        styler = styler.set_table_styles([
+            {"selector": "th", "props": [("white-space", "normal"), ("word-wrap", "break-word"), ("max-width", "120px")]},
+            {"selector": "td", "props": [("white-space", "nowrap")]}
+        ])
+
+        st.dataframe(styler, use_container_width=True, height=650)
+
+        csv_data = pivot_display.to_csv().encode("utf-8")
+        st.download_button(
+            f"Download Chunk Pivot (CSV) — {metric_label}",
+            data=csv_data,
+            file_name=f"tmss_chunk_pivot_{metric_col}.csv",
+            mime="text/csv"
+        )
+    else:
+        st.dataframe(styler, use_container_width=True, height=650)
+
+        csv_data = pivot.to_csv().encode("utf-8")
+        st.download_button(
+            f"Download Chunk Pivot (CSV) — {metric_label}",
+            data=csv_data,
+            file_name=f"tmss_chunk_pivot_{metric_col}.csv",
+            mime="text/csv"
+        )
 # ======================================================
 # Lane summary stats
 # ======================================================
