@@ -6,8 +6,33 @@ from streamlit import column_config as cc
 
 st.set_page_config(page_title="TMSS Rate Comparison MVP", layout="wide")
 
+# --- CSS: wrap headers, keep horizontal scrollbar visible, slightly tighter cells ---
+st.markdown(
+    """
+<style>
+/* Wrap column headers */
+div[data-testid="stDataFrame"] thead tr th div, 
+div[data-testid="stDataEditor"] thead tr th div {
+    white-space: normal !important;
+    line-height: 1.1 !important;
+}
+/* Wrap cell text where possible (Origin/Destination benefit) */
+div[data-testid="stDataFrame"] tbody tr td div,
+div[data-testid="stDataEditor"] tbody tr td div {
+    white-space: normal !important;
+    line-height: 1.15 !important;
+}
+/* Make scrollbars more consistently visible */
+div[data-testid="stDataFrame"] div[role="grid"] {
+    overflow: auto !important;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
 st.title("TMSS Rate Comparison (MVP)")
-st.caption("Upload TMSS exports (.xlsx/.csv). Filter lanes, pivot SCACs across top, and compare.")
+st.caption("Upload TMSS exports (.xlsx/.csv). Filter lanes, pivot SCACs across top, compare actual $ totals.")
 
 # ======================================================
 # CONFIG
@@ -15,18 +40,14 @@ st.caption("Upload TMSS exports (.xlsx/.csv). Filter lanes, pivot SCACs across t
 
 REQUIRED_COLS = [
     "SCAC", "SROID", "ORIGIN", "DESTINATION",
-    "LINEHAUL", "STORAGEINTRANSIT", "ACCESSORIALS", "UNACCOMPANIEDAIRBAG",
-    "CLASSVEHICLE1", "CLASSVEHICLE2", "CLASSVEHICLE3",
+    "LINEHAUL", "UNACCOMPANIEDAIRBAG",
+    "CLASSVEHICLE2",
 ]
 
-NUMERIC_COLS = [
-    "LINEHAUL", "STORAGEINTRANSIT", "ACCESSORIALS", "UNACCOMPANIEDAIRBAG",
-    "CLASSVEHICLE1", "CLASSVEHICLE2", "CLASSVEHICLE3",
-]
-
+NUMERIC_COLS = ["LINEHAUL", "UNACCOMPANIEDAIRBAG", "CLASSVEHICLE2"]
 STRING_COLS = ["SCAC", "SROID", "ORIGIN", "DESTINATION"]
 
-OUR_SCAC = "AMJV"  # change if needed
+OUR_SCAC = "AMJV"
 
 # ======================================================
 # DEFAULT BASELINES
@@ -45,7 +66,7 @@ DEFAULT_HHG_TABLE = pd.DataFrame(
 
 DEFAULT_UAB_TABLE = pd.DataFrame(
     [
-        {"uab_weight_break_kg": "45–133 kg", "uab_baseline": 1.26, "uab_actual_gross_weight": 133},
+        {"uab_weight_break_kg": "45–133 kg", "uab_baseline": 1.26, "uab_actual_gross_weight": 113},
         {"uab_weight_break_kg": "134–224 kg", "uab_baseline": 1.14, "uab_actual_gross_weight": 224},
         {"uab_weight_break_kg": "225–314 kg", "uab_baseline": 1.09, "uab_actual_gross_weight": 314},
         {"uab_weight_break_kg": "315–404 kg", "uab_baseline": 1.04, "uab_actual_gross_weight": 404},
@@ -53,21 +74,12 @@ DEFAULT_UAB_TABLE = pd.DataFrame(
     ]
 )
 
-DEFAULT_POV_TABLE = pd.DataFrame(
-    [
-        {"category": "CAT 2", "baseline": 21000.0},
-    ]
-)
-
-# Global TMSS rate (per your rule: 1000% = x10)
-DEFAULT_TMSS_RATE = 1000.0
-
 # ======================================================
 # UTILITIES
 # ======================================================
 
 def reset_app():
-    for k in ["data", "con", "filter_lists"]:
+    for k in ["data", "con", "filter_lists", "lane_inputs"]:
         if k in st.session_state:
             del st.session_state[k]
 
@@ -112,10 +124,8 @@ def load_with_progress(files) -> pl.DataFrame:
     out = pl.concat(frames, how="vertical")
     out = out.unique(subset=["SCAC", "SROID", "ORIGIN", "DESTINATION"], keep="first")
 
-    # Hide progress UI once done
     status.empty()
     progress_bar.empty()
-
     return out
 
 
@@ -123,24 +133,6 @@ def register_in_duckdb(df: pl.DataFrame):
     con = duckdb.connect(database=":memory:")
     con.register("tmss", df.to_arrow())
     return con
-
-
-def normalize_to_percent_expr(colname: str) -> pl.Expr:
-    """
-    Normalize factor-like numeric to WHOLE percent (e.g., 85.0 for 85%).
-    - decimals: 0.85 -> 85.0
-    - whole %: 85 -> 85.0
-    - TMSS-style: 850 -> 85.0, 1000 -> 100.0
-    """
-    return (
-        pl.when(pl.col(colname).is_null())
-        .then(pl.lit(None))
-        .when(pl.col(colname) <= 2.0)
-        .then(pl.col(colname) * 100.0)
-        .when(pl.col(colname) > 200.0)
-        .then(pl.col(colname) / 10.0)
-        .otherwise(pl.col(colname))
-    )
 
 
 def fmt_money(x: float, decimals: int = 2) -> str:
@@ -172,27 +164,15 @@ def build_uab_dropdown(uab_df: pd.DataFrame):
 def get_hhg_row(hhg_df: pd.DataFrame, break_label: str) -> dict:
     row = hhg_df.loc[hhg_df["hhg_weight_break_lbs"] == break_label]
     if row.empty:
-        raise ValueError(f"HHG baseline row not found for weight break: {break_label}")
+        raise ValueError(f"HHG baseline row not found for: {break_label}")
     return row.iloc[0].to_dict()
 
 
 def get_uab_row(uab_df: pd.DataFrame, break_label: str) -> dict:
     row = uab_df.loc[uab_df["uab_weight_break_kg"] == break_label]
     if row.empty:
-        raise ValueError(f"UAB baseline row not found for weight break: {break_label}")
+        raise ValueError(f"UAB baseline row not found for: {break_label}")
     return row.iloc[0].to_dict()
-
-
-def tmss_rate_to_multiplier(tmss_rate_value: float) -> float:
-    """
-    Your rule: TMSS rate 1000% = x10  => multiplier = tmss_rate / 100
-      1000 -> 10.0
-      850  -> 8.5
-      100  -> 1.0
-    """
-    if tmss_rate_value is None or pd.isna(tmss_rate_value):
-        return 1.0
-    return float(tmss_rate_value) / 100.0
 
 
 # ======================================================
@@ -205,34 +185,14 @@ if "hhg_table" not in st.session_state:
 if "uab_table" not in st.session_state:
     st.session_state["uab_table"] = DEFAULT_UAB_TABLE.copy()
 
-if "pov_table" not in st.session_state:
-    st.session_state["pov_table"] = DEFAULT_POV_TABLE.copy()
-
-if "tmss_rate_global" not in st.session_state:
-    st.session_state["tmss_rate_global"] = DEFAULT_TMSS_RATE
-
-
 # ======================================================
 # TABS
 # ======================================================
 
 tab_compare, tab_baselines = st.tabs(["Compare", "Baselines & Assumptions"])
 
-
-# ======================================================
-# BASELINES TAB
-# ======================================================
-
 with tab_baselines:
     st.subheader("Baselines & Assumptions (Editable)")
-
-    st.write("### Global TMSS Rate (applies across all calculations)")
-    st.session_state["tmss_rate_global"] = st.number_input(
-        "TMSS Rate (percent where 1000% = x10)",
-        min_value=0.0,
-        value=float(st.session_state["tmss_rate_global"]),
-        step=50.0,
-    )
 
     st.write("### HHG baselines (lbs)")
     st.session_state["hhg_table"] = st.data_editor(
@@ -262,31 +222,8 @@ with tab_baselines:
         key="uab_editor",
     )
 
-    st.write("### POV baseline (for reference)")
-    st.session_state["pov_table"] = st.data_editor(
-        st.session_state["pov_table"],
-        use_container_width=True,
-        height=140,
-        num_rows="dynamic",
-        column_config={
-            "category": cc.TextColumn("Category", width="small"),
-            "baseline": cc.NumberColumn("Baseline ($)", format="%.0f", width="small"),
-        },
-        key="pov_editor",
-    )
-
-    st.info("These settings apply when using the TOTAL RELO metrics in the Compare tab.")
-
-
-# ======================================================
-# COMPARE TAB
-# ======================================================
-
 with tab_compare:
 
-    # ----------------------------
-    # Upload Step
-    # ----------------------------
     if "data" not in st.session_state:
         uploaded = st.file_uploader(
             "Upload TMSS Rate File export(s) (.xlsx or .csv)",
@@ -315,7 +252,6 @@ with tab_compare:
 
         st.session_state["data"] = data
         st.session_state["con"] = con
-
         st.session_state["filter_lists"] = {
             "sroid": [x[0] for x in con.execute("SELECT DISTINCT SROID FROM tmss WHERE SROID IS NOT NULL ORDER BY SROID").fetchall()],
             "origin": [x[0] for x in con.execute("SELECT DISTINCT ORIGIN FROM tmss WHERE ORIGIN IS NOT NULL ORDER BY ORIGIN").fetchall()],
@@ -330,18 +266,15 @@ with tab_compare:
 
     st.button("Change uploaded files", on_click=reset_app)
 
-    # Sidebar filters
     st.sidebar.header("Filters")
     sel_sroid = st.sidebar.multiselect("SROID", lists["sroid"])
     sel_origin = st.sidebar.multiselect("Origin", lists["origin"])
     sel_dest = st.sidebar.multiselect("Destination", lists["dest"])
     sel_scac = st.sidebar.multiselect("SCAC", lists["scac"])
 
-    # Display controls
     st.sidebar.header("Display")
     max_lanes = st.sidebar.slider("Max lanes to show (rows)", 100, 5000, 1000, 100)
 
-    # Build WHERE clause
     where = ["1=1"]
     params = []
 
@@ -360,110 +293,114 @@ with tab_compare:
 
     query = f"""
     SELECT SCAC, SROID, ORIGIN, DESTINATION,
-           LINEHAUL, STORAGEINTRANSIT, ACCESSORIALS, UNACCOMPANIEDAIRBAG,
-           CLASSVEHICLE1, CLASSVEHICLE2, CLASSVEHICLE3
+           LINEHAUL, UNACCOMPANIEDAIRBAG, CLASSVEHICLE2
     FROM tmss
     WHERE {where_sql}
     """
     rows = pl.from_arrow(con.execute(query, params).arrow())
 
-    # Normalize percent-like columns to percent (85.0 == 85%)
-    rows = rows.with_columns([
-        normalize_to_percent_expr("LINEHAUL").alias("LINEHAUL"),
-        normalize_to_percent_expr("UNACCOMPANIEDAIRBAG").alias("UNACCOMPANIEDAIRBAG"),
-        normalize_to_percent_expr("STORAGEINTRANSIT").alias("STORAGEINTRANSIT"),
-        normalize_to_percent_expr("ACCESSORIALS").alias("ACCESSORIALS"),
-    ])
-
     st.write("## Chunk Pivot View")
 
-    metric_options = [
-        "HHE %",
-        "UAB %",
-        "Vehicle Cat 2 (flat)",
-        "TOTAL RELO HHE+UAB",
-        "TOTAL RELO HHE+UAB+POV",
-    ]
-    metric_label = st.selectbox("Metric", metric_options, key="metric_select")
-
-    # Pull baseline tables
     hhg_df = st.session_state["hhg_table"].copy()
     uab_df = st.session_state["uab_table"].copy()
 
-    # Only show baseline dropdowns when they matter
-    needs_baselines = metric_label in ["TOTAL RELO HHE+UAB", "TOTAL RELO HHE+UAB+POV"]
+    hhg_labels, hhg_lookup = build_hhg_dropdown(hhg_df)
+    uab_labels, uab_lookup = build_uab_dropdown(uab_df)
 
-    hhg_break = None
-    uab_break = None
+    hhg_choice = st.selectbox("HHG Baseline (Weight break | Baseline)", hhg_labels, index=0)
+    uab_choice = st.selectbox("UAB Baseline (Weight break | Baseline)", uab_labels, index=0)
 
-    if needs_baselines:
-        hhg_labels, hhg_lookup = build_hhg_dropdown(hhg_df)
-        uab_labels, uab_lookup = build_uab_dropdown(uab_df)
+    hhg_break = hhg_lookup.get(hhg_choice)
+    uab_break = uab_lookup.get(uab_choice)
 
-        # default N/A as you requested
-        hhg_choice = st.selectbox("HHG Baseline (Weight break | Baseline)", hhg_labels, index=0, key="hhg_choice")
-        uab_choice = st.selectbox("UAB Baseline (Weight break | Baseline)", uab_labels, index=0, key="uab_choice")
+    metric_options = [
+        "HHE (Actual $)",
+        "UAB (Actual $)",
+        "POV (Flat $)",
+        "TOTAL RELO HHE+UAB",
+        "TOTAL RELO HHE+UAB+POV",
+    ]
+    metric_label = st.selectbox("Metric", metric_options)
 
-        hhg_break = hhg_lookup.get(hhg_choice)
-        uab_break = uab_lookup.get(uab_choice)
+    # Lane inputs for AMJV overrides
+    lanes_pd = rows.select(["SROID", "ORIGIN", "DESTINATION"]).unique().to_pandas()
+    lanes_pd = lanes_pd.sort_values(["SROID", "ORIGIN", "DESTINATION"]).head(max_lanes).reset_index(drop=True)
 
-        tmss_multiplier = tmss_rate_to_multiplier(st.session_state["tmss_rate_global"])
-        st.caption(f"Using: TMSS multiplier **{tmss_multiplier:.2f}x** | HHG break: **{hhg_break or 'N/A'}** | UAB break: **{uab_break or 'N/A'}**")
-    else:
-        tmss_multiplier = tmss_rate_to_multiplier(st.session_state["tmss_rate_global"])
+    if "lane_inputs" not in st.session_state:
+        st.session_state["lane_inputs"] = lanes_pd.assign(HHG_RATE=None, UAB_RATE=None, POV_RATE=None)
 
-    # --- compute metric column ---
-    if metric_label == "HHE %":
-        rows_for_metric = rows
-        metric_use = "LINEHAUL"
+    existing = st.session_state["lane_inputs"].copy()
+    merged = lanes_pd.merge(existing, on=["SROID", "ORIGIN", "DESTINATION"], how="left")
+    st.session_state["lane_inputs"] = merged[["SROID", "ORIGIN", "DESTINATION", "HHG_RATE", "UAB_RATE", "POV_RATE"]]
 
-    elif metric_label == "UAB %":
-        rows_for_metric = rows
-        metric_use = "UNACCOMPANIEDAIRBAG"
+    st.write("### AMJV Lane Inputs (override replaces uploaded AMJV values; clearing inputs reverts to uploaded)")
+    edited_inputs = st.data_editor(
+        st.session_state["lane_inputs"],
+        use_container_width=True,
+        height=260,
+        num_rows="fixed",
+        column_config={
+            "SROID": cc.TextColumn("SROID", width="small"),
+            "ORIGIN": cc.TextColumn("ORIGIN", width="large"),
+            "DESTINATION": cc.TextColumn("DESTINATION", width="large"),
+            "HHG_RATE": cc.NumberColumn("HHG Rate (1000% = x10)", format="%.0f", width="small"),
+            "UAB_RATE": cc.NumberColumn("UAB Rate (1000% = x10)", format="%.0f", width="small"),
+            "POV_RATE": cc.NumberColumn("POV Rate ($ flat)", format="%.0f", width="small"),
+        },
+        key="lane_inputs_editor",
+    )
+    st.session_state["lane_inputs"] = edited_inputs
 
-    elif metric_label == "Vehicle Cat 2 (flat)":
-        rows_for_metric = rows
-        metric_use = "CLASSVEHICLE2"
+    rows2 = rows.join(pl.from_pandas(st.session_state["lane_inputs"]), on=["SROID", "ORIGIN", "DESTINATION"], how="left")
 
-    elif metric_label in ["TOTAL RELO HHE+UAB", "TOTAL RELO HHE+UAB+POV"]:
-        if hhg_break is None or uab_break is None:
-            st.warning("Select BOTH HHG and UAB baseline weight breaks (not N/A) to compute TOTAL RELO metrics.")
-            st.stop()
+    # --- Uploaded (absolute) competitor figures ---
+    hhg_uploaded = pl.col("LINEHAUL")
+    uab_uploaded = pl.col("UNACCOMPANIEDAIRBAG")
+    pov_uploaded = pl.col("CLASSVEHICLE2")
 
+    is_ours = (pl.col("SCAC") == OUR_SCAC)
+    have_baselines = (hhg_break is not None) & (uab_break is not None)
+
+    if have_baselines:
         hhg_row = get_hhg_row(hhg_df, hhg_break)
         uab_row = get_uab_row(uab_df, uab_break)
 
-        hhg_baseline = float(hhg_row["hhg_baseline"])
-        hhg_actual_net = float(hhg_row["hhg_actual_net_weight"])
+        HHG_BASELINE = float(hhg_row["hhg_baseline"])
+        HHG_ACTUAL_NET = float(hhg_row["hhg_actual_net_weight"])
+        UAB_BASELINE = float(uab_row["uab_baseline"])
+        UAB_ACTUAL_GROSS = float(uab_row["uab_actual_gross_weight"])
 
-        uab_baseline = float(uab_row["uab_baseline"])
-        uab_actual_gross = float(uab_row["uab_actual_gross_weight"])
+        # --- AMJV override values (absolute) ---
+        hhg_override = pl.lit(HHG_BASELINE) * (pl.col("HHG_RATE") / 100.0) * (pl.lit(HHG_ACTUAL_NET) / 100.0)
+        uab_override = pl.lit(UAB_BASELINE) * (pl.col("UAB_RATE") / 100.0) * pl.lit(UAB_ACTUAL_GROSS)
+        pov_override = pl.col("POV_RATE")
 
-        # Calculated Net Chargeable Weight = baseline * TMSS multiplier
-        hhg_calc_ncw = hhg_baseline * tmss_multiplier
-        uab_calc_ncw = uab_baseline * tmss_multiplier
-
-        # HHG billable = NCW * (Actual Net Weight / 100) * (HHE factor %)
-        hhg_billable = (hhg_calc_ncw * (hhg_actual_net / 100.0)) * (pl.col("LINEHAUL") / 100.0)
-
-        # UAB billable = NCW * (Actual Gross Weight / 100) * (UAB factor %)
-        uab_billable = (uab_calc_ncw * (uab_actual_gross / 100.0)) * (pl.col("UNACCOMPANIEDAIRBAG") / 100.0)
-
-        total_expr = hhg_billable + uab_billable
-
-        if metric_label == "TOTAL RELO HHE+UAB+POV":
-            # CONFIRMED: CLASSVEHICLE2 is a FLAT dollar value → add directly
-            total_expr = total_expr + pl.col("CLASSVEHICLE2")
-
-        rows_for_metric = rows.with_columns([total_expr.alias("TOTAL_RELO")])
-        metric_use = "TOTAL_RELO"
-
+        # --- Effective values:
+        # For AMJV, if a given override input exists, USE override; else revert to uploaded.
+        hhg_eff = pl.when(is_ours & pl.col("HHG_RATE").is_not_null()).then(hhg_override).otherwise(hhg_uploaded)
+        uab_eff = pl.when(is_ours & pl.col("UAB_RATE").is_not_null()).then(uab_override).otherwise(uab_uploaded)
+        pov_eff = pl.when(is_ours & pl.col("POV_RATE").is_not_null()).then(pov_override).otherwise(pov_uploaded)
     else:
-        rows_for_metric = rows
-        metric_use = "LINEHAUL"
+        # No baselines chosen -> nobody can be overridden, including AMJV
+        hhg_eff, uab_eff, pov_eff = hhg_uploaded, uab_uploaded, pov_uploaded
 
-    chunk_pd = rows_for_metric.select(["SROID", "ORIGIN", "DESTINATION", "SCAC", metric_use]).to_pandas()
+    # Metric selection
+    if metric_label == "HHE (Actual $)":
+        metric_expr = hhg_eff
+    elif metric_label == "UAB (Actual $)":
+        metric_expr = uab_eff
+    elif metric_label == "POV (Flat $)":
+        metric_expr = pov_eff
+    elif metric_label == "TOTAL RELO HHE+UAB":
+        metric_expr = hhg_eff + uab_eff
+    elif metric_label == "TOTAL RELO HHE+UAB+POV":
+        metric_expr = hhg_eff + uab_eff + pov_eff
+    else:
+        metric_expr = hhg_eff + uab_eff
 
+    rows_metric = rows2.with_columns(metric_expr.alias("METRIC"))
+
+    chunk_pd = rows_metric.select(["SROID", "ORIGIN", "DESTINATION", "SCAC", "METRIC"]).to_pandas()
     if chunk_pd.empty:
         st.info("No rows available for this chunk.")
         st.stop()
@@ -471,7 +408,7 @@ with tab_compare:
     pivot = chunk_pd.pivot_table(
         index=["SROID", "ORIGIN", "DESTINATION"],
         columns="SCAC",
-        values=metric_use,
+        values="METRIC",
         aggfunc="first"
     ).sort_index()
 
@@ -479,9 +416,7 @@ with tab_compare:
     pivot["max_competitor"] = pivot.max(axis=1, numeric_only=True)
     pivot["avg_competitor"] = pivot.mean(axis=1, numeric_only=True)
 
-    pivot[["min_competitor", "max_competitor", "avg_competitor"]] = (
-        pivot[["min_competitor", "max_competitor", "avg_competitor"]].round(0)
-    )
+    pivot = pivot.round(0)
 
     derived = ["avg_competitor", "min_competitor", "max_competitor"]
     scacs = [c for c in pivot.columns if c not in derived]
