@@ -115,7 +115,13 @@ def load_with_progress(files) -> pl.DataFrame:
             df = df.with_columns(pl.col(c).cast(pl.Utf8).str.strip_chars().alias(c))
 
         for c in NUMERIC_COLS:
-            df = df.with_columns(pl.col(c).cast(pl.Float64, strict=False).alias(c))
+            df = df.with_columns(
+                pl.col(c)
+                .cast(pl.Utf8, strict=False)
+                .str.replace_all(r"[\$,]", "")
+                .cast(pl.Float64, strict=False)
+                .alias(c)
+            )
 
         frames.append(df)
         progress_bar.progress(i / total, text=f"Loaded {i}/{total} files…")
@@ -351,7 +357,13 @@ with tab_compare:
     )
     st.session_state["lane_inputs"] = edited_inputs
 
-    rows2 = rows.join(pl.from_pandas(st.session_state["lane_inputs"]), on=["SROID", "ORIGIN", "DESTINATION"], how="left")
+    lane_inputs_pl = pl.from_pandas(st.session_state["lane_inputs"]).with_columns([
+        pl.col("HHG_RATE").cast(pl.Float64, strict=False),
+        pl.col("UAB_RATE").cast(pl.Float64, strict=False),  
+        pl.col("POV_RATE").cast(pl.Float64, strict=False),
+    ])
+
+    rows2 = rows.join(lane_inputs_pl, on=["SROID","ORIGIN","DESTINATION"], how="left")
 
     # --- Uploaded (absolute) competitor figures ---
     hhg_uploaded = pl.col("LINEHAUL")
