@@ -44,10 +44,16 @@ REQUIRED_COLS = [
     "CLASSVEHICLE2",
 ]
 
+# LINEHAUL & UNACCOMPANIEDAIRBAG are % fields (e.g., 125 = 125%)
+# CLASSVEHICLE2 is absolute $
 NUMERIC_COLS = ["LINEHAUL", "UNACCOMPANIEDAIRBAG", "CLASSVEHICLE2"]
 STRING_COLS = ["SCAC", "SROID", "ORIGIN", "DESTINATION"]
 
 OUR_SCAC = "AMJV"
+
+# Default baseline selections requested
+DEFAULT_HHG_BREAK = "2000–3999 lbs"
+DEFAULT_UAB_BREAK = "45–133 kg"
 
 # ======================================================
 # DEFAULT BASELINES
@@ -79,7 +85,7 @@ DEFAULT_UAB_TABLE = pd.DataFrame(
 # ======================================================
 
 def reset_app():
-    for k in ["data", "con", "filter_lists", "lane_inputs"]:
+    for k in ["data", "con", "filter_lists", "lane_inputs_map"]:
         if k in st.session_state:
             del st.session_state[k]
 
@@ -148,8 +154,8 @@ def fmt_money(x: float, decimals: int = 2) -> str:
 
 
 def build_hhg_dropdown(hhg_df: pd.DataFrame):
-    labels = ["N/A"]
-    lookup = {"N/A": None}
+    labels = []
+    lookup = {}
     for _, r in hhg_df.iterrows():
         label = f"{r['hhg_weight_break_lbs']} | {fmt_money(float(r['hhg_baseline']), 2)}"
         labels.append(label)
@@ -158,8 +164,8 @@ def build_hhg_dropdown(hhg_df: pd.DataFrame):
 
 
 def build_uab_dropdown(uab_df: pd.DataFrame):
-    labels = ["N/A"]
-    lookup = {"N/A": None}
+    labels = []
+    lookup = {}
     for _, r in uab_df.iterrows():
         label = f"{r['uab_weight_break_kg']} | {fmt_money(float(r['uab_baseline']), 2)}"
         labels.append(label)
@@ -181,6 +187,21 @@ def get_uab_row(uab_df: pd.DataFrame, break_label: str) -> dict:
     return row.iloc[0].to_dict()
 
 
+def default_index_for_break(labels: list[str], target_break: str) -> int:
+    """
+    labels format: "<break> | $<baseline>"
+    """
+    for i, lab in enumerate(labels):
+        if lab.startswith(target_break):
+            return i
+    return 0
+
+
+def make_lane_key(sroid: str, origin: str, dest: str) -> str:
+    # Use a delimiter unlikely to appear in the fields
+    return f"{sroid}⟂{origin}⟂{dest}"
+
+
 # ======================================================
 # SESSION STATE DEFAULTS
 # ======================================================
@@ -190,6 +211,11 @@ if "hhg_table" not in st.session_state:
 
 if "uab_table" not in st.session_state:
     st.session_state["uab_table"] = DEFAULT_UAB_TABLE.copy()
+
+# Lane inputs as a stable map (fixes revert/overwrite bug)
+if "lane_inputs_map" not in st.session_state:
+    # key -> dict with lane fields + inputs
+    st.session_state["lane_inputs_map"] = {}
 
 # ======================================================
 # TABS
@@ -222,7 +248,7 @@ with tab_baselines:
         num_rows="dynamic",
         column_config={
             "uab_weight_break_kg": cc.TextColumn("Weight Break (kg)", width="medium"),
-            "uab_baseline": cc.NumberColumn("Baseline ($)", format="%.2f", width="small"),
+            "uab_baseline": cc.NumberColumn("Baseline ($/kg)", format="%.2f", width="small"),
             "uab_actual_gross_weight": cc.NumberColumn("Actual Gross Weight (kg)", format="%.0f", width="small"),
         },
         key="uab_editor",
@@ -313,11 +339,28 @@ with tab_compare:
     hhg_labels, hhg_lookup = build_hhg_dropdown(hhg_df)
     uab_labels, uab_lookup = build_uab_dropdown(uab_df)
 
-    hhg_choice = st.selectbox("HHG Baseline (Weight break | Baseline)", hhg_labels, index=0)
-    uab_choice = st.selectbox("UAB Baseline (Weight break | Baseline)", uab_labels, index=0)
+    hhg_default_idx = default_index_for_break(hhg_labels, DEFAULT_HHG_BREAK)
+    uab_default_idx = default_index_for_break(uab_labels, DEFAULT_UAB_BREAK)
+
+    hhg_choice = st.selectbox(
+        "HHG Baseline (Weight break | Baseline)",
+        hhg_labels,
+        index=hhg_default_idx
+    )
+    uab_choice = st.selectbox(
+        "UAB Baseline (Weight break | Baseline)",
+        uab_labels,
+        index=uab_default_idx
+    )
 
     hhg_break = hhg_lookup.get(hhg_choice)
     uab_break = uab_lookup.get(uab_choice)
+
+    # Defensive: if defaults/breaks were edited away, fall back to first available
+    if hhg_break is None and len(hhg_df) > 0:
+        hhg_break = str(hhg_df.iloc[0]["hhg_weight_break_lbs"])
+    if uab_break is None and len(uab_df) > 0:
+        uab_break = str(uab_df.iloc[0]["uab_weight_break_kg"])
 
     metric_options = [
         "HHE (Actual $)",
@@ -328,87 +371,158 @@ with tab_compare:
     ]
     metric_label = st.selectbox("Metric", metric_options)
 
-    # Lane inputs for AMJV overrides
+    # ======================================================
+    # AMJV LANE INPUTS (stable map-based state; fixes revert bug)
+    # ======================================================
+
     lanes_pd = rows.select(["SROID", "ORIGIN", "DESTINATION"]).unique().to_pandas()
     lanes_pd = lanes_pd.sort_values(["SROID", "ORIGIN", "DESTINATION"]).head(max_lanes).reset_index(drop=True)
 
-    if "lane_inputs" not in st.session_state:
-        st.session_state["lane_inputs"] = lanes_pd.assign(HHG_RATE=None, UAB_RATE=None, POV_RATE=None)
+    # Ensure keys exist in map for currently displayed lanes
+    lane_map = st.session_state["lane_inputs_map"]
+    display_records = []
+    for _, r in lanes_pd.iterrows():
+        sroid = str(r["SROID"])
+        origin = str(r["ORIGIN"])
+        dest = str(r["DESTINATION"])
+        k = make_lane_key(sroid, origin, dest)
 
-    existing = st.session_state["lane_inputs"].copy()
-    merged = lanes_pd.merge(existing, on=["SROID", "ORIGIN", "DESTINATION"], how="left")
-    st.session_state["lane_inputs"] = merged[["SROID", "ORIGIN", "DESTINATION", "HHG_RATE", "UAB_RATE", "POV_RATE"]]
+        if k not in lane_map:
+            lane_map[k] = {
+                "SROID": sroid,
+                "ORIGIN": origin,
+                "DESTINATION": dest,
+                "HHG_RATE": None,
+                "UAB_RATE": None,
+                "POV_RATE": None,
+            }
 
-    st.write("### AMJV Lane Inputs (override replaces uploaded AMJV values; clearing inputs reverts to uploaded)")
+        display_records.append({
+            "LANE_KEY": k,
+            "SROID": lane_map[k]["SROID"],
+            "ORIGIN": lane_map[k]["ORIGIN"],
+            "DESTINATION": lane_map[k]["DESTINATION"],
+            "HHG_RATE": lane_map[k].get("HHG_RATE"),
+            "UAB_RATE": lane_map[k].get("UAB_RATE"),
+            "POV_RATE": lane_map[k].get("POV_RATE"),
+        })
+
+    st.session_state["lane_inputs_map"] = lane_map
+
+    inputs_df = pd.DataFrame(display_records)
+
+    st.write("### AMJV Lane Inputs (HHG/UAB are % overrides, POV is flat; clearing inputs reverts to TMSS export)")
     edited_inputs = st.data_editor(
-        st.session_state["lane_inputs"],
+        inputs_df,
         use_container_width=True,
         height=260,
         num_rows="fixed",
+        hide_index=True,
         column_config={
-            "SROID": cc.TextColumn("SROID", width="small"),
-            "ORIGIN": cc.TextColumn("ORIGIN", width="large"),
-            "DESTINATION": cc.TextColumn("DESTINATION", width="large"),
-            "HHG_RATE": cc.NumberColumn("HHG Rate (1000% = x10)", format="%.0f", width="small"),
-            "UAB_RATE": cc.NumberColumn("UAB Rate (1000% = x10)", format="%.0f", width="small"),
+            "LANE_KEY": cc.TextColumn("LANE_KEY", width="small", disabled=True),
+            "SROID": cc.TextColumn("SROID", width="small", disabled=True),
+            "ORIGIN": cc.TextColumn("ORIGIN", width="medium", disabled=True),
+            "DESTINATION": cc.TextColumn("DESTINATION", width="medium", disabled=True),
+            "HHG_RATE": cc.NumberColumn("HHG Rate (%)", format="%.0f", width="small"),
+            "UAB_RATE": cc.NumberColumn("UAB Rate (%)", format="%.0f", width="small"),
             "POV_RATE": cc.NumberColumn("POV Rate ($ flat)", format="%.0f", width="small"),
         },
         key="lane_inputs_editor",
     )
-    st.session_state["lane_inputs"] = edited_inputs
 
-    lane_inputs_pl = pl.from_pandas(st.session_state["lane_inputs"]).with_columns([
+    # Write edits back into map (authoritative)
+    lane_map = st.session_state["lane_inputs_map"]
+    for _, r in edited_inputs.iterrows():
+        k = r["LANE_KEY"]
+        if k in lane_map:
+            lane_map[k]["HHG_RATE"] = None if pd.isna(r["HHG_RATE"]) else float(r["HHG_RATE"])
+            lane_map[k]["UAB_RATE"] = None if pd.isna(r["UAB_RATE"]) else float(r["UAB_RATE"])
+            lane_map[k]["POV_RATE"] = None if pd.isna(r["POV_RATE"]) else float(r["POV_RATE"])
+
+    st.session_state["lane_inputs_map"] = lane_map
+
+    # Build lane inputs Polars for join
+    lane_inputs_pl = pl.from_pandas(
+        edited_inputs[["SROID", "ORIGIN", "DESTINATION", "HHG_RATE", "UAB_RATE", "POV_RATE"]]
+    ).with_columns([
         pl.col("HHG_RATE").cast(pl.Float64, strict=False),
-        pl.col("UAB_RATE").cast(pl.Float64, strict=False),  
+        pl.col("UAB_RATE").cast(pl.Float64, strict=False),
         pl.col("POV_RATE").cast(pl.Float64, strict=False),
     ])
 
-    rows2 = rows.join(lane_inputs_pl, on=["SROID","ORIGIN","DESTINATION"], how="left")
+    rows2 = rows.join(lane_inputs_pl, on=["SROID", "ORIGIN", "DESTINATION"], how="left")
 
-    # --- Uploaded (absolute) competitor figures ---
-    hhg_uploaded = pl.col("LINEHAUL")
-    uab_uploaded = pl.col("UNACCOMPANIEDAIRBAG")
-    pov_uploaded = pl.col("CLASSVEHICLE2")
+    # ======================================================
+    # CALCULATION LOGIC (PERCENT -> ACTUAL $)
+    # ======================================================
+
+    hhg_row = get_hhg_row(hhg_df, hhg_break)
+    uab_row = get_uab_row(uab_df, uab_break)
+
+    HHG_BASELINE = float(hhg_row["hhg_baseline"])                 # $
+    HHG_ACTUAL_NET = float(hhg_row["hhg_actual_net_weight"])      # lbs
+    UAB_BASELINE = float(uab_row["uab_baseline"])                 # $/kg
+    UAB_ACTUAL_GROSS = float(uab_row["uab_actual_gross_weight"])  # kg
+
+    lh_pct = pl.col("LINEHAUL")                 # percent
+    uab_pct = pl.col("UNACCOMPANIEDAIRBAG")     # percent
+    pov_abs = pl.col("CLASSVEHICLE2")           # absolute $
 
     is_ours = (pl.col("SCAC") == OUR_SCAC)
-    have_baselines = (hhg_break is not None) & (uab_break is not None)
 
-    if have_baselines:
-        hhg_row = get_hhg_row(hhg_df, hhg_break)
-        uab_row = get_uab_row(uab_df, uab_break)
+    # Default actual $ from TMSS % (null-safe inputs at component level)
+    hhg_from_tmss = (
+        pl.lit(HHG_BASELINE)
+        * (lh_pct.fill_null(0).fill_nan(0) / 100.0)
+        * (pl.lit(HHG_ACTUAL_NET) / 100.0)
+    )
 
-        HHG_BASELINE = float(hhg_row["hhg_baseline"])
-        HHG_ACTUAL_NET = float(hhg_row["hhg_actual_net_weight"])
-        UAB_BASELINE = float(uab_row["uab_baseline"])
-        UAB_ACTUAL_GROSS = float(uab_row["uab_actual_gross_weight"])
+    uab_from_tmss = (
+        pl.lit(UAB_BASELINE)
+        * (uab_pct.fill_null(0).fill_nan(0) / 100.0)
+        * pl.lit(UAB_ACTUAL_GROSS)
+    )
 
-        # --- AMJV override values (absolute) ---
-        hhg_override = pl.lit(HHG_BASELINE) * (pl.col("HHG_RATE") / 100.0) * (pl.lit(HHG_ACTUAL_NET) / 100.0)
-        uab_override = pl.lit(UAB_BASELINE) * (pl.col("UAB_RATE") / 100.0) * pl.lit(UAB_ACTUAL_GROSS)
-        pov_override = pl.col("POV_RATE")
+    # AMJV overrides: replace the % used in the calc (AMJV only)
+    hhg_from_override = (
+        pl.lit(HHG_BASELINE)
+        * (pl.col("HHG_RATE") / 100.0)
+        * (pl.lit(HHG_ACTUAL_NET) / 100.0)
+    )
 
-        # --- Effective values:
-        # For AMJV, if a given override input exists, USE override; else revert to uploaded.
-        hhg_eff = pl.when(is_ours & pl.col("HHG_RATE").is_not_null()).then(hhg_override).otherwise(hhg_uploaded)
-        uab_eff = pl.when(is_ours & pl.col("UAB_RATE").is_not_null()).then(uab_override).otherwise(uab_uploaded)
-        pov_eff = pl.when(is_ours & pl.col("POV_RATE").is_not_null()).then(pov_override).otherwise(pov_uploaded)
-    else:
-        # No baselines chosen -> nobody can be overridden, including AMJV
-        hhg_eff, uab_eff, pov_eff = hhg_uploaded, uab_uploaded, pov_uploaded
+    uab_from_override = (
+        pl.lit(UAB_BASELINE)
+        * (pl.col("UAB_RATE") / 100.0)
+        * pl.lit(UAB_ACTUAL_GROSS)
+    )
+
+    pov_from_override = pl.col("POV_RATE")
+
+    hhg_eff = pl.when(is_ours & pl.col("HHG_RATE").is_not_null()).then(hhg_from_override).otherwise(hhg_from_tmss)
+    uab_eff = pl.when(is_ours & pl.col("UAB_RATE").is_not_null()).then(uab_from_override).otherwise(uab_from_tmss)
+    pov_eff = pl.when(is_ours & pl.col("POV_RATE").is_not_null()).then(pov_from_override).otherwise(pov_abs)
+
+    # Null-safe versions for totals + display
+    hhg0 = hhg_eff.fill_null(0).fill_nan(0)
+    uab0 = uab_eff.fill_null(0).fill_nan(0)
+    pov0 = pov_eff.fill_null(0).fill_nan(0)
+
+    total_hhe_uab = (hhg0 + uab0)
+    total_hhe_uab_pov = (hhg0 + uab0 + pov0)
 
     # Metric selection
     if metric_label == "HHE (Actual $)":
-        metric_expr = hhg_eff
+        metric_expr = hhg0
     elif metric_label == "UAB (Actual $)":
-        metric_expr = uab_eff
+        metric_expr = uab0
     elif metric_label == "POV (Flat $)":
-        metric_expr = pov_eff
+        metric_expr = pov0
     elif metric_label == "TOTAL RELO HHE+UAB":
-        metric_expr = hhg_eff + uab_eff
+        metric_expr = total_hhe_uab
     elif metric_label == "TOTAL RELO HHE+UAB+POV":
-        metric_expr = hhg_eff + uab_eff + pov_eff
+        metric_expr = total_hhe_uab_pov
     else:
-        metric_expr = hhg_eff + uab_eff
+        metric_expr = total_hhe_uab
 
     rows_metric = rows2.with_columns(metric_expr.alias("METRIC"))
 
@@ -424,21 +538,35 @@ with tab_compare:
         aggfunc="first"
     ).sort_index()
 
+    # Derived columns
     pivot["min_competitor"] = pivot.min(axis=1, numeric_only=True)
     pivot["max_competitor"] = pivot.max(axis=1, numeric_only=True)
     pivot["avg_competitor"] = pivot.mean(axis=1, numeric_only=True)
 
+    # Round display
     pivot = pivot.round(0)
 
     derived = ["avg_competitor", "min_competitor", "max_competitor"]
     scacs = [c for c in pivot.columns if c not in derived]
 
+    # ===========================
+    # Ranking: AMJV position per lane
+    # 1 = least expensive; ties use "max" (tie for 1st among 2 => rank 2)
+    # ===========================
+    if OUR_SCAC in scacs:
+        rank_mat = pivot[scacs].rank(axis=1, method="max", ascending=True)
+        pivot["rank_amjv"] = rank_mat[OUR_SCAC]
+    else:
+        pivot["rank_amjv"] = pd.NA
+
+    # Reorder columns: rank left of avg_competitor
     if OUR_SCAC in scacs:
         scacs = [OUR_SCAC] + [c for c in scacs if c != OUR_SCAC]
 
-    pivot = pivot[derived + scacs]
-    pivot.insert(3, "│", "")
+    pivot = pivot[["rank_amjv"] + derived + scacs]
+    pivot.insert(4, "│", "")  # after max_competitor (rank, avg, min, max, │, scacs...)
 
+    # Rename AMJV with star
     if OUR_SCAC in pivot.columns:
         pivot = pivot.rename(columns={OUR_SCAC: f"{OUR_SCAC} ⭐"})
 
@@ -451,8 +579,9 @@ with tab_compare:
         disabled=True,
         column_config={
             "SROID": cc.TextColumn("SROID", width="small"),
-            "ORIGIN": cc.TextColumn("ORIGIN", width="large"),
-            "DESTINATION": cc.TextColumn("DESTINATION", width="large"),
+            "ORIGIN": cc.TextColumn("ORIGIN", width="medium"),
+            "DESTINATION": cc.TextColumn("DESTINATION", width="medium"),
+            "rank_amjv": cc.NumberColumn("rank", format="%.0f", width="small"),
             "avg_competitor": cc.NumberColumn("avg_competitor", format="%.0f", width="small"),
             "min_competitor": cc.NumberColumn("min_competitor", format="%.0f", width="small"),
             "max_competitor": cc.NumberColumn("max_competitor", format="%.0f", width="small"),
