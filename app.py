@@ -32,7 +32,7 @@ div[data-testid="stDataFrame"] div[role="grid"] {
 )
 
 st.title("TMSS Rate Comparison (MVP)")
-st.caption("Upload TMSS exports (.xlsx/.csv). Filter lanes, pivot SCACs across top, compare actual $ totals.")
+st.caption("Upload TMSS exports (.xlsx/.csv). Filter lanes, pivot SCACs across top, compare filed % and computed totals ($).")
 
 # ======================================================
 # CONFIG
@@ -44,8 +44,8 @@ REQUIRED_COLS = [
     "CLASSVEHICLE2",
 ]
 
-# LINEHAUL & UNACCOMPANIEDAIRBAG are % fields (e.g., 125 = 125%)
-# CLASSVEHICLE2 is absolute $
+# LINEHAUL & UNACCOMPANIEDAIRBAG are filed % fields (e.g., 125 = 125%)
+# CLASSVEHICLE2 is filed absolute $
 NUMERIC_COLS = ["LINEHAUL", "UNACCOMPANIEDAIRBAG", "CLASSVEHICLE2"]
 STRING_COLS = ["SCAC", "SROID", "ORIGIN", "DESTINATION"]
 
@@ -220,6 +220,7 @@ tab_compare, tab_baselines = st.tabs(["Compare", "Baselines & Assumptions"])
 
 with tab_baselines:
     st.subheader("Baselines & Assumptions (Editable)")
+    st.caption("Used only for Total Relo calculations. Filed HHE/UAB/POV metrics display TMSS export values as-is.")
 
     st.write("### HHG baselines (lbs)")
     st.session_state["hhg_table"] = st.data_editor(
@@ -337,16 +338,8 @@ with tab_compare:
     hhg_default_idx = default_index_for_break(hhg_labels, DEFAULT_HHG_BREAK)
     uab_default_idx = default_index_for_break(uab_labels, DEFAULT_UAB_BREAK)
 
-    hhg_choice = st.selectbox(
-        "HHG Baseline (Weight break | Baseline)",
-        hhg_labels,
-        index=hhg_default_idx
-    )
-    uab_choice = st.selectbox(
-        "UAB Baseline (Weight break | Baseline)",
-        uab_labels,
-        index=uab_default_idx
-    )
+    hhg_choice = st.selectbox("HHG Baseline (Weight break | Baseline)", hhg_labels, index=hhg_default_idx)
+    uab_choice = st.selectbox("UAB Baseline (Weight break | Baseline)", uab_labels, index=uab_default_idx)
 
     hhg_break = hhg_lookup.get(hhg_choice)
     uab_break = uab_lookup.get(uab_choice)
@@ -358,17 +351,17 @@ with tab_compare:
         uab_break = str(uab_df.iloc[0]["uab_weight_break_kg"])
 
     metric_options = [
-        "HHE (Actual $)",
-        "UAB (Actual $)",
-        "POV (Flat $)",
-        "TOTAL RELO HHE+UAB",
-        "TOTAL RELO HHE+UAB+POV",
+        "HHE (Filed %)",
+        "UAB (Filed %)",
+        "POV (Filed $)",
+        "TOTAL RELO HHE+UAB ($)",
+        "TOTAL RELO HHE+UAB+POV ($)",
     ]
     metric_label = st.selectbox("Metric", metric_options)
 
     # ======================================================
-    # AMJV LANE INPUTS (map-backed, but commit edits via on_change using edited_rows)
-    # This avoids the "enter twice" bug in Streamlit 1.54.0.
+    # AMJV LANE INPUTS (commit edits via on_change using edited_rows)
+    # Fixes Streamlit 1.54.0 "enter twice" lag
     # ======================================================
 
     lanes_pd = rows.select(["SROID", "ORIGIN", "DESTINATION"]).unique().to_pandas()
@@ -387,9 +380,9 @@ with tab_compare:
                 "SROID": sroid,
                 "ORIGIN": origin,
                 "DESTINATION": dest,
-                "HHG_RATE": None,
-                "UAB_RATE": None,
-                "POV_RATE": None,
+                "HHG_RATE": None,  # override % for totals only
+                "UAB_RATE": None,  # override % for totals only
+                "POV_RATE": None,  # override $ for totals only
             }
 
         display_records.append({
@@ -434,7 +427,7 @@ with tab_compare:
 
         st.session_state["lane_inputs_map"] = lane_map_local
 
-    st.write("### AMJV Lane Inputs (HHG/UAB are % overrides, POV is flat; clearing inputs reverts to TMSS export)")
+    st.write("### AMJV Lane Inputs (affect TOTALS only; filed HHE/UAB/POV metrics always show TMSS export values)")
     _ = st.data_editor(
         inputs_df,
         use_container_width=True,
@@ -454,9 +447,9 @@ with tab_compare:
         on_change=lane_inputs_changed,
     )
 
-    # Build lane inputs Polars for join (from the authoritative map, not the editor return)
+    # Build lane inputs Polars for join (from authoritative map)
     lane_rows = []
-    for k, v in st.session_state["lane_inputs_map"].items():
+    for _, v in st.session_state["lane_inputs_map"].items():
         lane_rows.append({
             "SROID": v["SROID"],
             "ORIGIN": v["ORIGIN"],
@@ -474,7 +467,10 @@ with tab_compare:
     rows2 = rows.join(lane_inputs_pl, on=["SROID", "ORIGIN", "DESTINATION"], how="left")
 
     # ======================================================
-    # CALCULATION LOGIC (PERCENT -> ACTUAL $)
+    # CALCULATION LOGIC
+    # - HHE/UAB/POV metrics: show TMSS export values as-is (NO baseline calculations)
+    # - Total Relo metrics: compute $ using baselines + filed % values
+    #   (AMJV lane inputs override %/$ used in TOTALS only)
     # ======================================================
 
     hhg_row = get_hhg_row(hhg_df, hhg_break)
@@ -485,33 +481,33 @@ with tab_compare:
     UAB_BASELINE = float(uab_row["uab_baseline"])                 # $/kg
     UAB_ACTUAL_GROSS = float(uab_row["uab_actual_gross_weight"])  # kg
 
-    lh_pct = pl.col("LINEHAUL")                 # percent
-    uab_pct = pl.col("UNACCOMPANIEDAIRBAG")     # percent
-    pov_abs = pl.col("CLASSVEHICLE2")           # absolute $
+    lh_pct = pl.col("LINEHAUL")                 # filed %
+    uab_pct = pl.col("UNACCOMPANIEDAIRBAG")     # filed %
+    pov_abs = pl.col("CLASSVEHICLE2")           # filed $
 
     is_ours = (pl.col("SCAC") == OUR_SCAC)
 
-    # Default actual $ from TMSS % (null-safe at component level)
-    hhg_from_tmss = (
+    # --- Totals: default actual $ from filed % (null-safe at component level)
+    hhg_from_filed_pct = (
         pl.lit(HHG_BASELINE)
         * (lh_pct.fill_null(0).fill_nan(0) / 100.0)
         * (pl.lit(HHG_ACTUAL_NET) / 100.0)
     )
 
-    uab_from_tmss = (
+    uab_from_filed_pct = (
         pl.lit(UAB_BASELINE)
         * (uab_pct.fill_null(0).fill_nan(0) / 100.0)
         * pl.lit(UAB_ACTUAL_GROSS)
     )
 
-    # AMJV overrides: replace % used in calc (AMJV only)
-    hhg_from_override = (
+    # --- Totals: AMJV overrides replace the %/$ used in the calc (AMJV only)
+    hhg_from_override_pct = (
         pl.lit(HHG_BASELINE)
         * (pl.col("HHG_RATE") / 100.0)
         * (pl.lit(HHG_ACTUAL_NET) / 100.0)
     )
 
-    uab_from_override = (
+    uab_from_override_pct = (
         pl.lit(UAB_BASELINE)
         * (pl.col("UAB_RATE") / 100.0)
         * pl.lit(UAB_ACTUAL_GROSS)
@@ -519,28 +515,28 @@ with tab_compare:
 
     pov_from_override = pl.col("POV_RATE")
 
-    hhg_eff = pl.when(is_ours & pl.col("HHG_RATE").is_not_null()).then(hhg_from_override).otherwise(hhg_from_tmss)
-    uab_eff = pl.when(is_ours & pl.col("UAB_RATE").is_not_null()).then(uab_from_override).otherwise(uab_from_tmss)
-    pov_eff = pl.when(is_ours & pl.col("POV_RATE").is_not_null()).then(pov_from_override).otherwise(pov_abs)
+    hhg_for_totals = pl.when(is_ours & pl.col("HHG_RATE").is_not_null()).then(hhg_from_override_pct).otherwise(hhg_from_filed_pct)
+    uab_for_totals = pl.when(is_ours & pl.col("UAB_RATE").is_not_null()).then(uab_from_override_pct).otherwise(uab_from_filed_pct)
+    pov_for_totals = pl.when(is_ours & pl.col("POV_RATE").is_not_null()).then(pov_from_override).otherwise(pov_abs)
 
-    # Null-safe versions for totals + display
-    hhg0 = hhg_eff.fill_null(0).fill_nan(0)
-    uab0 = uab_eff.fill_null(0).fill_nan(0)
-    pov0 = pov_eff.fill_null(0).fill_nan(0)
+    # Null-safe versions for totals
+    hhg_total0 = hhg_for_totals.fill_null(0).fill_nan(0)
+    uab_total0 = uab_for_totals.fill_null(0).fill_nan(0)
+    pov_total0 = pov_for_totals.fill_null(0).fill_nan(0)
 
-    total_hhe_uab = (hhg0 + uab0)
-    total_hhe_uab_pov = (hhg0 + uab0 + pov0)
+    total_hhe_uab = (hhg_total0 + uab_total0)
+    total_hhe_uab_pov = (hhg_total0 + uab_total0 + pov_total0)
 
     # Metric selection
-    if metric_label == "HHE (Actual $)":
-        metric_expr = hhg0
-    elif metric_label == "UAB (Actual $)":
-        metric_expr = uab0
-    elif metric_label == "POV (Flat $)":
-        metric_expr = pov0
-    elif metric_label == "TOTAL RELO HHE+UAB":
+    if metric_label == "HHE (Filed %)":
+        metric_expr = lh_pct
+    elif metric_label == "UAB (Filed %)":
+        metric_expr = uab_pct
+    elif metric_label == "POV (Filed $)":
+        metric_expr = pov_abs
+    elif metric_label == "TOTAL RELO HHE+UAB ($)":
         metric_expr = total_hhe_uab
-    elif metric_label == "TOTAL RELO HHE+UAB+POV":
+    elif metric_label == "TOTAL RELO HHE+UAB+POV ($)":
         metric_expr = total_hhe_uab_pov
     else:
         metric_expr = total_hhe_uab
@@ -559,30 +555,32 @@ with tab_compare:
         aggfunc="first"
     ).sort_index()
 
-    # Derived columns
-    pivot["min_competitor"] = pivot.min(axis=1, numeric_only=True)
-    pivot["max_competitor"] = pivot.max(axis=1, numeric_only=True)
-    pivot["avg_competitor"] = pivot.mean(axis=1, numeric_only=True)
+    # Derived columns (ignore NaNs)
+    pivot["min_competitor"] = pivot.min(axis=1, numeric_only=True, skipna=True)
+    pivot["max_competitor"] = pivot.max(axis=1, numeric_only=True, skipna=True)
+    pivot["avg_competitor"] = pivot.mean(axis=1, numeric_only=True, skipna=True)
 
-    # Round display
-    pivot = pivot.round(0)
-
+    # Rank: AMJV position per lane; 1 = least expensive; ties use "max" (tie for 1st among 2 => rank 2)
     derived = ["avg_competitor", "min_competitor", "max_competitor"]
     scacs = [c for c in pivot.columns if c not in derived]
 
-    # Ranking: AMJV position per lane; ties use "max" (tie for least among 2 => rank 2)
     if OUR_SCAC in scacs:
         rank_mat = pivot[scacs].rank(axis=1, method="max", ascending=True)
         pivot["rank_amjv"] = rank_mat[OUR_SCAC]
     else:
         pivot["rank_amjv"] = pd.NA
 
+    # Round display: keep whole numbers for totals; keep whole numbers for % too (as before)
+    pivot = pivot.round(0)
+
+    # Reorder columns: rank left of avg_competitor; AMJV first among SCACs
     if OUR_SCAC in scacs:
         scacs = [OUR_SCAC] + [c for c in scacs if c != OUR_SCAC]
 
     pivot = pivot[["rank_amjv"] + derived + scacs]
-    pivot.insert(4, "│", "")
+    pivot.insert(4, "│", "")  # after max_competitor
 
+    # Rename AMJV with star
     if OUR_SCAC in pivot.columns:
         pivot = pivot.rename(columns={OUR_SCAC: f"{OUR_SCAC} ⭐"})
 
