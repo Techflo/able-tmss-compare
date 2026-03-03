@@ -85,7 +85,7 @@ DEFAULT_UAB_TABLE = pd.DataFrame(
 # ======================================================
 
 def reset_app():
-    for k in ["data", "con", "filter_lists", "lane_inputs_map"]:
+    for k in ["data", "con", "filter_lists", "lane_inputs_map", "lane_inputs_display_df"]:
         if k in st.session_state:
             del st.session_state[k]
 
@@ -188,9 +188,6 @@ def get_uab_row(uab_df: pd.DataFrame, break_label: str) -> dict:
 
 
 def default_index_for_break(labels: list[str], target_break: str) -> int:
-    """
-    labels format: "<break> | $<baseline>"
-    """
     for i, lab in enumerate(labels):
         if lab.startswith(target_break):
             return i
@@ -198,7 +195,6 @@ def default_index_for_break(labels: list[str], target_break: str) -> int:
 
 
 def make_lane_key(sroid: str, origin: str, dest: str) -> str:
-    # Use a delimiter unlikely to appear in the fields
     return f"{sroid}⟂{origin}⟂{dest}"
 
 
@@ -212,9 +208,8 @@ if "hhg_table" not in st.session_state:
 if "uab_table" not in st.session_state:
     st.session_state["uab_table"] = DEFAULT_UAB_TABLE.copy()
 
-# Lane inputs as a stable map (fixes revert/overwrite bug)
+# Lane inputs as a stable map (keyed by LANE_KEY)
 if "lane_inputs_map" not in st.session_state:
-    # key -> dict with lane fields + inputs
     st.session_state["lane_inputs_map"] = {}
 
 # ======================================================
@@ -372,13 +367,13 @@ with tab_compare:
     metric_label = st.selectbox("Metric", metric_options)
 
     # ======================================================
-    # AMJV LANE INPUTS (stable map-based state; fixes revert bug)
+    # AMJV LANE INPUTS (map-backed, but commit edits via on_change using edited_rows)
+    # This avoids the "enter twice" bug in Streamlit 1.54.0.
     # ======================================================
 
     lanes_pd = rows.select(["SROID", "ORIGIN", "DESTINATION"]).unique().to_pandas()
     lanes_pd = lanes_pd.sort_values(["SROID", "ORIGIN", "DESTINATION"]).head(max_lanes).reset_index(drop=True)
 
-    # Ensure keys exist in map for currently displayed lanes
     lane_map = st.session_state["lane_inputs_map"]
     display_records = []
     for _, r in lanes_pd.iterrows():
@@ -408,11 +403,39 @@ with tab_compare:
         })
 
     st.session_state["lane_inputs_map"] = lane_map
-
     inputs_df = pd.DataFrame(display_records)
+    st.session_state["lane_inputs_display_df"] = inputs_df
+
+    def lane_inputs_changed():
+        state = st.session_state.get("lane_inputs_editor", {})
+        edited_rows = state.get("edited_rows", {}) or {}
+
+        lane_map_local = st.session_state["lane_inputs_map"]
+        df_disp = st.session_state["lane_inputs_display_df"]
+
+        # Apply deltas (only changed fields)
+        for row_idx, changes in edited_rows.items():
+            row_idx = int(row_idx)
+            if row_idx < 0 or row_idx >= len(df_disp):
+                continue
+            k = df_disp.iloc[row_idx]["LANE_KEY"]
+            if k not in lane_map_local:
+                continue
+
+            if "HHG_RATE" in changes:
+                v = changes["HHG_RATE"]
+                lane_map_local[k]["HHG_RATE"] = None if v is None else float(v)
+            if "UAB_RATE" in changes:
+                v = changes["UAB_RATE"]
+                lane_map_local[k]["UAB_RATE"] = None if v is None else float(v)
+            if "POV_RATE" in changes:
+                v = changes["POV_RATE"]
+                lane_map_local[k]["POV_RATE"] = None if v is None else float(v)
+
+        st.session_state["lane_inputs_map"] = lane_map_local
 
     st.write("### AMJV Lane Inputs (HHG/UAB are % overrides, POV is flat; clearing inputs reverts to TMSS export)")
-    edited_inputs = st.data_editor(
+    _ = st.data_editor(
         inputs_df,
         use_container_width=True,
         height=260,
@@ -428,23 +451,21 @@ with tab_compare:
             "POV_RATE": cc.NumberColumn("POV Rate ($ flat)", format="%.0f", width="small"),
         },
         key="lane_inputs_editor",
+        on_change=lane_inputs_changed,
     )
 
-    # Write edits back into map (authoritative)
-    lane_map = st.session_state["lane_inputs_map"]
-    for _, r in edited_inputs.iterrows():
-        k = r["LANE_KEY"]
-        if k in lane_map:
-            lane_map[k]["HHG_RATE"] = None if pd.isna(r["HHG_RATE"]) else float(r["HHG_RATE"])
-            lane_map[k]["UAB_RATE"] = None if pd.isna(r["UAB_RATE"]) else float(r["UAB_RATE"])
-            lane_map[k]["POV_RATE"] = None if pd.isna(r["POV_RATE"]) else float(r["POV_RATE"])
-
-    st.session_state["lane_inputs_map"] = lane_map
-
-    # Build lane inputs Polars for join
-    lane_inputs_pl = pl.from_pandas(
-        edited_inputs[["SROID", "ORIGIN", "DESTINATION", "HHG_RATE", "UAB_RATE", "POV_RATE"]]
-    ).with_columns([
+    # Build lane inputs Polars for join (from the authoritative map, not the editor return)
+    lane_rows = []
+    for k, v in st.session_state["lane_inputs_map"].items():
+        lane_rows.append({
+            "SROID": v["SROID"],
+            "ORIGIN": v["ORIGIN"],
+            "DESTINATION": v["DESTINATION"],
+            "HHG_RATE": v.get("HHG_RATE"),
+            "UAB_RATE": v.get("UAB_RATE"),
+            "POV_RATE": v.get("POV_RATE"),
+        })
+    lane_inputs_pl = pl.from_pandas(pd.DataFrame(lane_rows)).with_columns([
         pl.col("HHG_RATE").cast(pl.Float64, strict=False),
         pl.col("UAB_RATE").cast(pl.Float64, strict=False),
         pl.col("POV_RATE").cast(pl.Float64, strict=False),
@@ -470,7 +491,7 @@ with tab_compare:
 
     is_ours = (pl.col("SCAC") == OUR_SCAC)
 
-    # Default actual $ from TMSS % (null-safe inputs at component level)
+    # Default actual $ from TMSS % (null-safe at component level)
     hhg_from_tmss = (
         pl.lit(HHG_BASELINE)
         * (lh_pct.fill_null(0).fill_nan(0) / 100.0)
@@ -483,7 +504,7 @@ with tab_compare:
         * pl.lit(UAB_ACTUAL_GROSS)
     )
 
-    # AMJV overrides: replace the % used in the calc (AMJV only)
+    # AMJV overrides: replace % used in calc (AMJV only)
     hhg_from_override = (
         pl.lit(HHG_BASELINE)
         * (pl.col("HHG_RATE") / 100.0)
@@ -549,24 +570,19 @@ with tab_compare:
     derived = ["avg_competitor", "min_competitor", "max_competitor"]
     scacs = [c for c in pivot.columns if c not in derived]
 
-    # ===========================
-    # Ranking: AMJV position per lane
-    # 1 = least expensive; ties use "max" (tie for 1st among 2 => rank 2)
-    # ===========================
+    # Ranking: AMJV position per lane; ties use "max" (tie for least among 2 => rank 2)
     if OUR_SCAC in scacs:
         rank_mat = pivot[scacs].rank(axis=1, method="max", ascending=True)
         pivot["rank_amjv"] = rank_mat[OUR_SCAC]
     else:
         pivot["rank_amjv"] = pd.NA
 
-    # Reorder columns: rank left of avg_competitor
     if OUR_SCAC in scacs:
         scacs = [OUR_SCAC] + [c for c in scacs if c != OUR_SCAC]
 
     pivot = pivot[["rank_amjv"] + derived + scacs]
-    pivot.insert(4, "│", "")  # after max_competitor (rank, avg, min, max, │, scacs...)
+    pivot.insert(4, "│", "")
 
-    # Rename AMJV with star
     if OUR_SCAC in pivot.columns:
         pivot = pivot.rename(columns={OUR_SCAC: f"{OUR_SCAC} ⭐"})
 
